@@ -24,7 +24,6 @@ import async
 import logging
 import sys
 import os
-from pprint import pprint
 import struct
 
 import nsq
@@ -42,6 +41,9 @@ class OMReader(object):
         self.nsqd_tcp_addresses = nsqd_addresses
         self.poll = select.poll()
         self.shutdown = False
+
+        self.hostname = socket.gethostname()
+        self.short_hostname = self.hostname.split('.')[0]
         
     def resolve_nsqd_addresses(self):
         pass
@@ -55,13 +57,13 @@ class OMReader(object):
             self.connect_one(address)
 
     def connect_one(self, address):
-        print "Connecting to %s" % (address,)
+        logging.debug("Connecting to %s", address)
         
         self.connections[address] = {
             'socket': None,
             'state': 'connecting',
             'time': time.time(),
-            'out': '', # output buffer
+            #'out': '', # output buffer
             'in': '', # incoming buffer
             'closed': True,
         }
@@ -69,7 +71,7 @@ class OMReader(object):
         try:
             sock = socket.create_connection(address, 5)
         except socket.error:
-            print "Error connecting: %s" % sys.exc_info()[1]
+            logging.error("Error connecting: %s" % sys.exc_info()[1])
             return None
 
         self.connections[address]['socket'] = sock
@@ -79,14 +81,14 @@ class OMReader(object):
         sock.setblocking(0)
         
         sock.send(nsq.MAGIC_V2)
-        sock.send(nsq.subscribe(self.topic, self.channel, 'a', 'b'))
-        sock.send(nsq.ready(10))
-        
-        self.poll.register(sock, select.POLLIN + select.POLLPRI + select.POLLOUT + select.POLLERR + select.POLLHUP)
+        sock.send(nsq.subscribe(self.topic, self.channel, self.short_hostname, self.hostname))
+        sock.send(nsq.ready(self.max_in_flight))
+
+        # maybe, poll POLLOUT as well, but it is so boring
+        self.poll.register(sock, select.POLLIN + select.POLLPRI + select.POLLERR + select.POLLHUP)
         
 
     def connections_check(self):
-        #print 'connections check'
         to_connect = []
         
         for address, item in self.connections.items():
@@ -104,7 +106,6 @@ class OMReader(object):
             self.connect_one(address)
 
         self.connections_last_check = time.time()
-        #pprint(self.connections)
 
     def connection_search(self, fd):
         item = None
@@ -117,7 +118,7 @@ class OMReader(object):
             
 
     def connection_close(self, address):
-        print 'unregistering and closing connection to %s' % (address,)
+        logging.debug("unregistering and closing connection to %s", address)
         
         item = self.connections[address]
         self.poll.unregister(item['socket'])
@@ -132,42 +133,39 @@ class OMReader(object):
         """Process incoming data. All return data will remain as rest of buffer"""
         res = None
         if len(data) >= 4:
-            print "Processing data"
             packet_length = struct.unpack('>l', data[:4])[0]
             if len(data) >= 4 + packet_length:
                 # yeah, complete response received
 
                 frame_id, frame_data = nsq.unpack_response(data[4 : packet_length + 4])
                 if frame_id == nsq.FRAME_TYPE_MESSAGE:
-                    self.connections[address]['socket'].sendall(nsq.ready(10))
+                    self.connections[address]['socket'].send(nsq.ready(self.max_in_flight))
                     message = nsq.decode_message(frame_data)
                     
                     try:
                         res, delay = self.message_callback(message)
                     except:
-                        print "Error calling message callback. Requeuing message with default queue delay. Exception: %s" % sys.exc_info()[1]
+                        logging.error("Error calling message callback. Requeuing message with default queue delay. Exception: %s", sys.exc_info()[1])
                         res, delay = False, self.requeue_delay
 
                     if res:
-                        print "Message %s processed successfully" % message.id
+                        logging.info("Message %s processed successfully", message.id)
                         self.connections[address]['socket'].sendall(nsq.finish(message.id))
                     else:
-                        print "Requeueing message %s with delay %d" % (message.id, delay)
+                        logging.info("Requeueing message %s with delay %d", message.id, delay)
                         self.connections[address]['socket'].sendall(nsq.requeue(message.id, str(int(delay * 1000))))
                     
                 elif frame_id == nsq.FRAME_TYPE_ERROR:
-                    print "error received. wtf?"
-                    pprint(frame_data)
+                    logging.error("Error received. Frame data: %s", repr(frame_data))
+                    
                 elif frame_id == nsq.FRAME_TYPE_RESPONSE:
                     if frame_data == '_heartbeat_':
-                        print "hearbeat received. Answering with nop"
+                        logging.debug("hearbeat received. Answering with nop")
                         self.connections[address]['socket'].send(nsq.nop())
                     else:
-                        print "response received. wtf?"
-                        pprint(frame_data)
+                        logging.debug("Unknown response received. Frame data: %s", repr(frame_data))
                 else:
-                    print "unknown frame_id received: %s" % frame_id
-                    pprint(frame_data)
+                    logging.error("Unknown frame_id received: %s. Frame data: %s", frame_id, repr(frame_data))
                 
                 
                 res = data[4 + packet_length : ]
@@ -177,7 +175,7 @@ class OMReader(object):
     def stop(self):
         self.shutdown = True
         for address, item in self.connections.items():
-            print "Sending CLS to %s" % (address,)
+            logging.debug("Sending CLS to %s", address)
             item['socket'].sendall(nsq.cls())
 
         
@@ -185,9 +183,9 @@ class OMReader(object):
         
         self.connect()
 
+        logging.info("Starting OMReader for topic '%s'..." % self.topic)
         
         while not self.shutdown:
-            #print "Polling"
             time.sleep(0.00001)
             data = self.poll.poll(1)
             
@@ -200,16 +198,13 @@ class OMReader(object):
                     continue
                 
                 
-                #print "Event received for connection #%d %s: %d" % (fd, self.connections[fd]['address'], event)
-                
                 if event & select.POLLIN or event & select.POLLPRI:
-                    print "%s: There are data to read" % (address,)
+                    logging.debug("%s: There are data to read", address)
                     data = item['socket'].recv(8192)
                     if data:
                         item['in'] += data
                         
                         while len(item['in']) > 4:
-                            print '%s: buf len: %d' % (address, len(item['in']))
                             old_len = len(item['in'])
                             data_new = self.process_data(address, item['in'])
                             
@@ -218,24 +213,23 @@ class OMReader(object):
                             
                             if data_new is None or old_len == len(data_new):
                                 # data not changed, breaking loop
-                                print '%s: breaking loop, %s, %s' % (address, old_len, len(data_new))
                                 break
                             
                         
                     else:
-                        print "%s Socket closed" % (address,)
+                        logging.warning("%s Socket closed", address)
                         if not address in closed_addresses:
                             closed_addresses.append(address)
 
                     
-                elif event & select.POLLOUT:
-                    if item['out']:
-                        print "%s: Can write data there" % (address,)
-                        item['socket'].send(item['out'])
-                        item['out'] = ''
+                ## elif event & select.POLLOUT:
+                ##     if item['out']:
+                ##         logging.(print "%s: Can write data there" % (address,)
+                ##         item['socket'].send(item['out'])
+                ##         item['out'] = ''
                         
                 elif event & select.POLLHUP or event & select.POLLERR:
-                    print "%s: Socket failed. Need reconnecting" % (address,)
+                    logging.warning("%s: Socket failed. Need reconnecting", address)
                     
                     if not address in closed_addresses:
                         closed_addresses.append(address)
@@ -248,22 +242,22 @@ class OMReader(object):
                 self.connections_check()
             
             
-        logging.info("Starting OMReader for topic '%s'..." % self.topic)
-        pass
+
     
         
 
 if __name__ == '__main__':
 
+    logging.basicConfig(filename="omreader.log", level=logging.DEBUG)
+
     total = 0
     def test_callback(message):
         global total, reader
-        print("Received message id: %s, timestamp: %s, attempts: %d, body: %s" % (message.id, message.timestamp, message.attempts, message.body))
+        logging.info("Received message id: %s, timestamp: %s, attempts: %d, body: %s", message.id, message.timestamp, message.attempts, message.body)
         
         total += 1
         
-        print "*" * 50
-        print "Total: %d" % total
+        logging.info("Total: %d", total)
 
         if total >= 1000:
             reader.stop()
@@ -271,7 +265,6 @@ if __name__ == '__main__':
         return random.choice([True, False, True]), 5
     
 
-    addresses = [('conan', 4150), ('barlog', 4150)]
     addresses = [('localhost', 4150)]
     reader = OMReader(test_callback, sys.argv[1], sys.argv[1], addresses)
     
