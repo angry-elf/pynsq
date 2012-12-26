@@ -48,6 +48,9 @@ def requeue(id, time_ms):
 def nop():
     return _command('NOP')
 
+def cls():
+    return _command('CLS')
+
 def valid_topic_name(topic):
     if not 0 < len(topic) < 33:
         return False
