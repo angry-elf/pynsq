@@ -53,6 +53,26 @@ import struct
 
 import nsq
 
+def resolve_nsqd_addresses(hostports):
+    """Resolve addresses to host-port tuples (compatible with socket.connect()), check uniqueness and return it"""
+    addresses = []
+
+    for host, port in hostports:
+        try:
+            logging.debug("Resolving address %s:%s (tcp, ipv4)", host, port)
+            gai = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        except:
+            logging.error("Error resolving address %s:%s: %s", host, port, sys.exc_info()[1])
+            gai = []
+
+        for family, socktype, proto, canonname, sockaddr in gai:
+            if not sockaddr in addresses:
+                logging.debug("Adding %s to list of known nsqd servers", sockaddr)
+                addresses.append(sockaddr)
+
+    return addresses
+
+
 class OMMessage(nsq.Message):
     """Extended message object. Can handle finalize/requeue events by itself"""
 
@@ -103,31 +123,13 @@ Optional arguments:
         self.requeue_delay = requeue_delay
         
         self.nsqd_addresses = nsqd_addresses # just store what was passed to constructor
-        self.nsqd_tcp_addresses = self.resolve_nsqd_addresses(self.nsqd_addresses)
+        self.nsqd_tcp_addresses = resolve_nsqd_addresses(self.nsqd_addresses)
         self.poll = select.poll()
         self.shutdown = False
 
         self.hostname = socket.gethostname()
         self.short_hostname = self.hostname.split('.')[0]
         
-    def resolve_nsqd_addresses(self, hostports):
-        """Resolve addresses to host-port tuples (compatible with socket.connect()), check uniqueness and return it"""
-        addresses = []
-        
-        for host, port in hostports:
-            try:
-                logging.debug("Resolving address %s:%s (tcp, ipv4)", host, port)
-                gai = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-            except:
-                logging.error("Error resolving address %s:%s: %s", host, port, sys.exc_info()[1])
-                gai = []
-                
-            for family, socktype, proto, canonname, sockaddr in gai:
-                if not sockaddr in addresses:
-                    logging.debug("Adding %s to list of known nsqd servers", sockaddr)
-                    addresses.append(sockaddr)
-
-        return addresses
         
     def connect(self):
         self.connections = {}
