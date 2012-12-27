@@ -9,9 +9,32 @@ Supports multiple nsqd connections using plain list of hosts, multiple A-records
 Differences from NSQReader:
 1. Message processing assume to be independent from message to message. One failed message do not make slower overall message processing (not using BackoffTimer at all).
 2. We don't use lookupd server query since all required nsqd may be defined through DNS.
-3. Max message attempts and requeue interval is controlled by user-side. The only requeue delay is for failed callbacks
-4. OMReader do not use tornado. It uses select.poll() object for handling multiple asyn connections
+3. Max message attempts and requeue interval is controlled by user-side (at callback function). The only requeue delay is for failed callbacks.
+4. OMReader do not use tornado. It uses select.poll() object for handling multiple async connections.
 5. As of 5, all OMReader instances are isolated. You can run and stop them as you wish.
+
+Example:
+
+```
+    total = 0
+    def my_callback(message):
+        global total, reader
+        
+        total += 1
+        
+        if total >= 1000:
+            reader.stop()
+
+        # requeue every third message just for fun
+        if random.choice([True, False, True]):
+            message.finish()
+        else:
+            message.requeue(5)
+
+    reader = OMReader([('nsqd.example.com', 4150)], my_callback, 'test', max_in_flight=1000)
+    
+    reader.run()
+```
 
 """
 
@@ -28,34 +51,91 @@ import struct
 
 import nsq
 
+class OMMessage(nsq.Message):
+    """Extended message object. Can handle finalize/requeue events by itself"""
+
+    def __init__(self, message, socket):
+        super(OMMessage, self).__init__(message.id, message.body, message.timestamp, message.attempts)
+        self.socket = socket
+        self.status = 'pending'
+        
+    def finish(self):
+        """Finalize message (mark as successfull processed)"""
+        assert self.status == 'pending', "Message is already finalized (status: %s)" % self.status
+        self.socket.sendall(nsq.finish(self.id))
+        self.status = 'finished'
+        
+        
+    def requeue(self, delay=60):
+        """Requeue message with delay (in seconds)"""
+        assert self.status == 'pending', "Message is already finalized (status: %s)" % self.status
+        self.socket.sendall(nsq.requeue(self.id, str(int(delay * 1000))))
+        self.status = 'requeued'
+        
+        
 class OMReader(object):
-    def __init__(self, message_callback, topic, channel=None, nsqd_addresses=None, max_in_flight=1, requeue_delay=90):
+    def __init__(self, nsqd_addresses, message_callback, topic, channel=None, max_in_flight=1, requeue_delay=90, addresses_ttl=60):
+        """
+Initializes OMReader object.
+
+Required arguments:
+  * nsqd_addresses - tuple of (host, port) addresses, compatible with socket.getaddrinfo() call. If returned more than one - connections will made to every returned record
+  * message_callback receives one argument - OMMessage object. Callback function must finalize message by itself (using .finish() or .requeue(delay) methods). If callback have not finalized message, OMReader will requeue this message with default delay (requeue_delay argument). OMReader ignores (but logs) possible message_callbacks exceptions. Only message.status is counted
+  * topic - nsqd topic to listen
+
+Optional arguments:
+  * channel - channel to connect. Defaults to topic name
+  * max_in_flight - will be uses in RDY command for every connection (may be changed in future versions)
+  * requeue_delay - default requeue delay if message_callback fail (raises exception)
+  * addresses_ttl - every this period of time addresses will be re-looked up and, if something changed, reconnecting. You may use this feature to create load-balancing and failover using your DNS server.
+
+        """
         
         self.message_callback = message_callback
         self.topic = topic
         self.channel = channel or topic
         self.max_in_flight = max_in_flight
         self.requeue_delay = requeue_delay
+        self.addresses_ttl = addresses_ttl
+        self.addresses_ttl_last = time.time()
         
-        self.nsqd_addresses = nsqd_addresses
-        self.nsqd_tcp_addresses = nsqd_addresses
+        self.nsqd_addresses = nsqd_addresses # just store what was passed to constructor
+        self.nsqd_tcp_addresses = self.resolve_nsqd_addresses(self.nsqd_addresses)
         self.poll = select.poll()
         self.shutdown = False
 
         self.hostname = socket.gethostname()
         self.short_hostname = self.hostname.split('.')[0]
         
-    def resolve_nsqd_addresses(self):
-        pass
+    def resolve_nsqd_addresses(self, hostports):
+        """Resolve addresses to host-port tuples (compatible with socket.connect()), check uniqueness and return it"""
+        addresses = []
+        
+        for host, port in hostports:
+            try:
+                logging.debug("Resolving address %s:%s (tcp, ipv4)", host, port)
+                gai = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+            except:
+                logging.error("Error resolving address %s:%s: %s", host, port, sys.exc_info()[1])
+                gai = []
+                
+            for family, socktype, proto, canonname, sockaddr in gai:
+                if not sockaddr in addresses:
+                    logging.debug("Adding %s to list of known nsqd servers", sockaddr)
+                    addresses.append(sockaddr)
 
-
+        return addresses
+        
     def connect(self):
         self.connections = {}
         self.connections_last_check = time.time()
-        
-        for address in self.nsqd_tcp_addresses:
-            self.connect_one(address)
 
+        if self.nsqd_tcp_addresses:
+            for address in self.nsqd_tcp_addresses:
+                self.connect_one(address)
+        else:
+            raise Exception("No connections available. Can't run!")
+        
     def connect_one(self, address):
         logging.debug("Connecting to %s", address)
         
@@ -140,20 +220,18 @@ class OMReader(object):
                 frame_id, frame_data = nsq.unpack_response(data[4 : packet_length + 4])
                 if frame_id == nsq.FRAME_TYPE_MESSAGE:
                     self.connections[address]['socket'].send(nsq.ready(self.max_in_flight))
-                    message = nsq.decode_message(frame_data)
+                    message = OMMessage(nsq.decode_message(frame_data), self.connections[address]['socket'])
                     
                     try:
-                        res, delay = self.message_callback(message)
+                        self.message_callback(message)
                     except:
-                        logging.error("Error calling message callback. Requeuing message with default queue delay. Exception: %s", sys.exc_info()[1])
-                        res, delay = False, self.requeue_delay
-
-                    if res:
-                        logging.info("Message %s processed successfully", message.id)
-                        self.connections[address]['socket'].sendall(nsq.finish(message.id))
-                    else:
-                        logging.info("Requeueing message %s with delay %d", message.id, delay)
-                        self.connections[address]['socket'].sendall(nsq.requeue(message.id, str(int(delay * 1000))))
+                        logging.error("Error calling message callback. Exception: %s", sys.exc_info()[1])
+                    
+                    
+                    if message.status == 'pending':
+                        logging.warning("Message not processed. Requeueing message %s with delay %d", message.id, self.requeue_delay)
+                        message.requeue(self.requeue_delay)
+                        
                     
                 elif frame_id == nsq.FRAME_TYPE_ERROR:
                     logging.error("Error received. Frame data: %s", repr(frame_data))
@@ -171,7 +249,7 @@ class OMReader(object):
                 res = data[4 + packet_length : ]
                 
         return res
-
+    
     def stop(self):
         self.shutdown = True
         for address, item in self.connections.items():
@@ -261,12 +339,21 @@ if __name__ == '__main__':
 
         if total >= 1000:
             reader.stop()
-        
-        return random.choice([True, False, True]), 5
+
+        if random.choice([True, False, True]):
+            message.finish()
+        else:
+            message.requeue(5)
+    
     
 
-    addresses = [('localhost', 4150)]
-    reader = OMReader(test_callback, sys.argv[1], sys.argv[1], addresses)
+    if len(sys.argv) > 2:
+        host, port = sys.argv[2].split(':')
+        addresses = [(host, int(port))]
+    else:
+        addresses = [('localhost', 4150)]
+        
+    reader = OMReader(addresses, test_callback, sys.argv[1], max_in_flight=1000)
     
     reader.run()
 
