@@ -7,9 +7,11 @@ high-level NSQ reader class built on top of a select.poll() supporting async (ca
 Supports multiple nsqd connections using plain list of hosts, multiple A-records or (near future) SRV-requests.
 
 Differences from NSQReader:
-1. Message processing assume to be independent from message to message. One failed message do not make slower overall message processing (not using BackoffTimer at all).
+1. Message processing assume to be independent from message to message. One failed message do not make slower overall
+   message processing (not using BackoffTimer at all).
 2. We don't use lookupd server query since all required nsqd may be defined through DNS.
-3. Max message attempts and requeue interval is controlled by user-side (at callback function). The only requeue delay is for failed callbacks.
+3. Max message attempts and requeue interval is controlled by user-side (at callback function). The only requeue
+   delay is for failed callbacks.
 4. OMReader do not use tornado. It uses select.poll() object for handling multiple async connections.
 5. As of 5, all OMReader instances are isolated. You can run and stop them as you wish.
 
@@ -74,20 +76,23 @@ class OMMessage(nsq.Message):
         
         
 class OMReader(object):
-    def __init__(self, nsqd_addresses, message_callback, topic, channel=None, max_in_flight=1, requeue_delay=90, addresses_ttl=60):
+    def __init__(self, nsqd_addresses, message_callback, topic, channel=None, max_in_flight=1, requeue_delay=90):
         """
 Initializes OMReader object.
 
 Required arguments:
-  * nsqd_addresses - tuple of (host, port) addresses, compatible with socket.getaddrinfo() call. If returned more than one - connections will made to every returned record
-  * message_callback receives one argument - OMMessage object. Callback function must finalize message by itself (using .finish() or .requeue(delay) methods). If callback have not finalized message, OMReader will requeue this message with default delay (requeue_delay argument). OMReader ignores (but logs) possible message_callbacks exceptions. Only message.status is counted
+  * nsqd_addresses - tuple of (host, port) addresses, compatible with socket.getaddrinfo() call. If returned more
+  than one - connections will made to every returned record
+  * message_callback receives one argument - OMMessage object. Callback function must finalize message by itself
+  (using .finish() or .requeue(delay) methods). If callback have not finalized message, OMReader will requeue
+  this message with default delay (requeue_delay argument). OMReader ignores (but logs) possible message_callbacks
+  exceptions. Only message.status is counted
   * topic - nsqd topic to listen
 
 Optional arguments:
   * channel - channel to connect. Defaults to topic name
   * max_in_flight - will be uses in RDY command for every connection (may be changed in future versions)
   * requeue_delay - default requeue delay if message_callback fail (raises exception)
-  * addresses_ttl - every this period of time addresses will be re-looked up and, if something changed, reconnecting. You may use this feature to create load-balancing and failover using your DNS server.
 
         """
         
@@ -96,8 +101,6 @@ Optional arguments:
         self.channel = channel or topic
         self.max_in_flight = max_in_flight
         self.requeue_delay = requeue_delay
-        self.addresses_ttl = addresses_ttl
-        self.addresses_ttl_last = time.time()
         
         self.nsqd_addresses = nsqd_addresses # just store what was passed to constructor
         self.nsqd_tcp_addresses = self.resolve_nsqd_addresses(self.nsqd_addresses)
