@@ -227,10 +227,7 @@ Optional arguments:
                     self.connections[address]['socket'].send(nsq.ready(self.max_in_flight))
                     message = OMMessage(nsq.decode_message(frame_data), self.connections[address]['socket'])
                     
-                    try:
-                        self.message_callback(message)
-                    except:
-                        logging.error("Error calling message callback. Exception: %s", sys.exc_info()[1])
+                    self.message_callback(message)
                     
                     
                     if message.status == 'pending':
