@@ -7,6 +7,7 @@ import json
 import random
 import time
 import urllib
+import logging
 
 from OMReader import resolve_nsqd_addresses
 
@@ -38,30 +39,36 @@ def nsq_write(nsqd_addresses, topic, message, message_format="json", max_attempt
     put = False
     
     while put_attempts < max_attempts:
-        
+        logging.debug("Putting message to %s (attempt: %d/%d)", topic, put_attempts, max_attempts)
         host, port = random.choice(addresses)
 
+        url = 'http://%s:%s/put?topic=%s' % (host, port, urllib.quote(topic))
         try:
-            response = urllib.urlopen('http://%s:%s/put?topic=%s' % (host, port, urllib.quote(topic)), message_raw).read()
+            response = urllib.urlopen(url, message_raw).read()
             assert response == 'OK', "Invalid put response: %s" % response
             put = True
+            logging.info("Message posted successfully")
         except:
-            print sys.exc_info()
+            logging.error("Error POST'ing to %s: %s", url, sys.exc_info()[1])
             pass
 
         if put:
             break
-        
-        time.sleep(random_float(1, 5))
+
+        delay = random_float(1, 5)
+        logging.debug("Sleeping %.3f seconds before retry", delay)
+        time.sleep(delay)
         put_attempts += 1
 
-    
+    if not put:
+        logging.warning("Message dropped - can't put to any server now")
     return put
 
 
 if __name__ == '__main__':
-
-
+    
+    logging.basicConfig(level=logging.DEBUG)
+    
     if len(sys.argv) > 2:
         host, port = sys.argv[2].split(':')
         addresses = [(host, int(port))]
@@ -70,7 +77,9 @@ if __name__ == '__main__':
 
     
     for i in range(0, 1000):
-        nsq_write(addresses, sys.argv[1], {'text': 'Hello, world!', 'i': i})
+        logging.info("Posting message #%d", i)
+        result = nsq_write(addresses, sys.argv[1], {'text': 'Hello, world!', 'i': i})
+        logging.info("Posting result: %s", result)
     
 
 
