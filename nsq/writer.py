@@ -17,7 +17,7 @@ def random_float(_from, to):
 def nsq_write(nsqd_addresses, topic, message, message_format="json", max_attempts=10):
     """Put message (optionally raw, defaults = json-encoded) with topic to nsqd-server (one of nsqds records).
   * nsqd_addresses is tuple of (host, nsqd_http_port) addresses, compatible with socket.getaddrinfo() call.
-  If returned more than one - write will be made to one of them (first success)
+  If returned more than one - write will be made to one of them (first success in random order)
   
 
     """
