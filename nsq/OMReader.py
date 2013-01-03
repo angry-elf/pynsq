@@ -331,7 +331,7 @@ Optional arguments:
 
 if __name__ == '__main__':
 
-    logging.basicConfig(filename="omreader.log", level=logging.DEBUG)
+    logging.basicConfig(level=logging.DEBUG)
 
     total = 0
     def test_callback(message):
