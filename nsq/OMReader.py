@@ -84,6 +84,7 @@ class OMMessage(nsq.Message):
     def finish(self):
         """Finalize message (mark as successfull processed)"""
         assert self.status == 'pending', "Message is already finalized (status: %s)" % self.status
+        logging.debug("Sending FIN for %s", self.id)
         self.socket.sendall(nsq.finish(self.id))
         self.status = 'finished'
         
@@ -91,6 +92,7 @@ class OMMessage(nsq.Message):
     def requeue(self, delay=60):
         """Requeue message with delay (in seconds)"""
         assert self.status == 'pending', "Message is already finalized (status: %s)" % self.status
+        logging.debug("Sending REQ for %s", self.id)
         self.socket.sendall(nsq.requeue(self.id, str(int(delay * 1000))))
         self.status = 'requeued'
         
@@ -167,7 +169,9 @@ Optional arguments:
         
         sock.send(nsq.MAGIC_V2)
         sock.send(nsq.subscribe(self.topic, self.channel, self.short_hostname, self.hostname))
-        sock.send(nsq.ready(self.max_in_flight))
+        if not self.shutdown:
+            logging.debug("Sending max_in_flight=%s to %s", self.max_in_flight, address)
+            sock.send(nsq.ready(self.max_in_flight))
 
         # maybe, poll POLLOUT as well, but it is so boring
         self.poll.register(sock, select.POLLIN + select.POLLPRI + select.POLLERR + select.POLLHUP)
@@ -224,16 +228,22 @@ Optional arguments:
 
                 frame_id, frame_data = nsq.unpack_response(data[4 : packet_length + 4])
                 if frame_id == nsq.FRAME_TYPE_MESSAGE:
-                    self.connections[address]['socket'].send(nsq.ready(self.max_in_flight))
+                    
                     message = OMMessage(nsq.decode_message(frame_data), self.connections[address]['socket'])
-                    
+
+                    logging.debug("Calling callback")
                     self.message_callback(message)
-                    
+                    logging.debug("Callback done. Message status == %s", message.status)
                     
                     if message.status == 'pending':
                         logging.warning("Message not processed. Requeueing message %s with delay %d", message.id, self.requeue_delay)
                         message.requeue(self.requeue_delay)
-                        
+                    
+                    if not self.shutdown:
+                        logging.debug("Sending max_in_flight=%d to %s", self.max_in_flight, address)
+                        self.connections[address]['socket'].send(nsq.ready(self.max_in_flight))
+                    
+                    
                     
                 elif frame_id == nsq.FRAME_TYPE_ERROR:
                     logging.error("Error received. Frame data: %s", repr(frame_data))
@@ -253,6 +263,7 @@ Optional arguments:
         return res
     
     def stop(self):
+        logging.info("Shutdown requested")
         self.shutdown = True
         for address, item in self.connections.items():
             logging.debug("Sending CLS to %s", address)
@@ -265,9 +276,13 @@ Optional arguments:
 
         logging.info("Starting OMReader for topic '%s'..." % self.topic)
         
-        while not self.shutdown:
+        while True:
             time.sleep(0.00001)
             data = self.poll.poll(1)
+
+            if not data and self.shutdown:
+                logging.info("No more data in sockets. Shutting down")
+                break
             
             closed_addresses = []
             
@@ -307,7 +322,7 @@ Optional arguments:
                 ##         logging.(print "%s: Can write data there" % (address,)
                 ##         item['socket'].send(item['out'])
                 ##         item['out'] = ''
-                        
+                
                 elif event & select.POLLHUP or event & select.POLLERR:
                     logging.warning("%s: Socket failed. Need reconnecting", address)
                     
@@ -322,7 +337,7 @@ Optional arguments:
                 self.connections_check()
             
             
-
+        
     
         
 
@@ -333,7 +348,7 @@ if __name__ == '__main__':
     total = 0
     def test_callback(message):
         global total, reader
-        logging.info("Received message id: %s, timestamp: %s, attempts: %d, body: %s", message.id, message.timestamp, message.attempts, message.body)
+        logging.info("Received message id: %s, timestamp: %s, attempts: %d, body: %s", message.id, message.timestamp, message.attempts, repr(message.body))
         
         total += 1
         
